@@ -26,12 +26,10 @@ function initPool(): pg.Pool {
     );
   }
 
-  // Read the connection's `sslmode` (if present), then strip it from the URL.
-  // node-postgres now treats `sslmode=require` as `verify-full` (strict cert
-  // verification), which would override the explicit `ssl` config below and
-  // fail against providers like Supabase that present a self-signed cert in
-  // the chain (SELF_SIGNED_CERT_IN_CHAIN). We re-derive SSL ourselves so the
-  // explicit `ssl` setting is authoritative.
+  // Validate connection URL formatting and detect unencoded special characters in password.
+  // In connection URIs (postgres://user:password@host...), special characters such as '@', '#', or ':'
+  // in the password must be percent-encoded (e.g. '@' as '%40'). An unencoded '@' causes URI parsers
+  // to split prematurely, treating password characters as the host and failing with ENOTFOUND or auth errors.
   let sslmode: string | null = null;
   let connectionString = dbUrl;
   try {
@@ -39,8 +37,29 @@ function initPool(): pg.Pool {
     sslmode = u.searchParams.get("sslmode");
     u.searchParams.delete("sslmode");
     connectionString = u.toString();
-  } catch {
-    // Not a parseable URL (rare); fall back to the raw value unchanged.
+
+    // Secondary check: verify that host is present and does not resemble an accidental password leak
+    if (!u.hostname) {
+      throw new Error(
+        "Invalid database connection URL: missing hostname. If your password contains special characters like '@', '#', or ':', ensure it is percent-encoded (e.g. '%40' for '@').",
+      );
+    }
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message.startsWith("Invalid database connection URL")) {
+      throw err;
+    }
+    // If URL parsing failed entirely:
+    // Check if the URI pattern appears broken due to unencoded special characters
+    const hasMultipleAts = (dbUrl.match(/@/g) || []).length > 1;
+    if (hasMultipleAts) {
+      throw new Error(
+        "Invalid database connection URL: multiple '@' characters detected. Special characters in the password (such as '@', '#', or ':') must be percent-encoded (e.g. '%40' for '@').",
+      );
+    }
+    // Generic safe error or fallback
+    throw new Error(
+      "Invalid database connection URL format. Ensure the URL is valid and any special characters in the password are percent-encoded.",
+    );
   }
 
   // Decide SSL:
