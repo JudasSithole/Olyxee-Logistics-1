@@ -3,11 +3,29 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // ─── Mock @workspace/db ───────────────────────────────────────────────────────
 const dbState = vi.hoisted(() => ({
   inserted: [] as Array<Record<string, unknown>>,
+  // Rows that findRecentDuplicateSms() returns. Empty = no recent duplicate,
+  // which is the default for every test below.
+  recentDuplicates: [] as Array<{ id: string }>,
 }));
 const inserted = dbState.inserted;
 
+// Drizzle's select().from().where().orderBy() is a thenable chain. Mimic it
+// so the dedupe query in sms-dedup.ts resolves to whatever the current test
+// needs without touching a real database.
+function makeSelectChain(rows: unknown[]) {
+  const terminal = Promise.resolve(rows);
+  const chain: Record<string, unknown> = {};
+  for (const m of ["from", "where", "orderBy", "limit"]) {
+    chain[m] = vi.fn(() => chain);
+  }
+  chain.then = (resolve: (v: unknown) => void) => terminal.then(resolve);
+  chain.catch = (reject: (e: unknown) => void) => terminal.reject(reject);
+  return chain;
+}
+
 vi.mock("@workspace/db", () => ({
   db: {
+    select: vi.fn(() => makeSelectChain(dbState.recentDuplicates)),
     insert: vi.fn(() => ({
       values: vi.fn((row: Record<string, unknown>) => {
         dbState.inserted.push(row);
@@ -49,6 +67,7 @@ const BASE_PARAMS = {
 beforeEach(() => {
   vi.clearAllMocks();
   inserted.length = 0;
+  dbState.recentDuplicates = [];
 });
 
 afterEach(() => {
@@ -178,42 +197,61 @@ describe("sendOrderSms — recipient, template content, and single-send guarante
   });
 });
 
-describe("sendOrderSms — duplicate protection (GAP: none exists)", () => {
-  // There is no idempotency key, no unique constraint on sms_notifications,
-  // and no "already notified for this status" check anywhere in
-  // sendOrderSms() or the sms_notifications schema. Calling this twice with
-  // identical parameters - e.g. a double-click, a client retry after a
-  // dropped response, or two concurrent requests - sends two SMS. The
-  // /orders/:orderId/status route's own forward-progression guard even
-  // explicitly allows re-setting the SAME status (`targetIndex >= currentIndex`
-  // in lib/order-statuses/src/logistics.ts), so this is reachable in
-  // production, not just a theoretical unit-test scenario.
-  it("BUG: sends the SAME notification twice when triggered twice with identical params", async () => {
+describe("sendOrderSms — duplicate protection", () => {
+  // Dedupe lives in sms-dedup.ts: a retried request (client resubmit, a
+  // double-click, a reconnect-and-retry after a timeout) must never fan out a
+  // second identical SMS. It treats "the same order already has a
+  // successfully-sent SMS with this exact body in the last few minutes" as a
+  // duplicate and skips re-sending. A genuinely new status/body, or the same
+  // body sent again after the window, still sends.
+  it("skips the second identical send and reuses the prior notification id", async () => {
     smsMock.isSmsConfigured.mockReturnValue(true);
     usageMock.getMonthlySmsUsage.mockResolvedValue(0);
-    smsMock.sendSms.mockResolvedValue({ success: true, providerMessageId: "msg-dup" });
+    smsMock.sendSms.mockResolvedValue({ success: true, providerMessageId: "msg-1" });
 
     const first = await sendOrderSms({ ...BASE_PARAMS, businessPlan: "beta" });
+    expect(first.smsStatus).toBe("sent");
+    expect(smsMock.sendSms).toHaveBeenCalledTimes(1);
+    expect(inserted).toHaveLength(1);
+
+    // Second trigger with identical params: the dedupe query finds the first
+    // sent notification and short-circuits before touching the provider.
+    dbState.recentDuplicates = [{ id: "sms-notif-1" }];
     const second = await sendOrderSms({ ...BASE_PARAMS, businessPlan: "beta" });
 
-    expect(first.smsStatus).toBe("sent");
-    expect(second.smsStatus).toBe("sent"); // no dedupe: sends again
-    expect(smsMock.sendSms).toHaveBeenCalledTimes(2);
-    expect(inserted).toHaveLength(2);
+    expect(second.smsStatus).toBe("skipped");
+    expect(second.smsNotificationId).toBe("sms-notif-1");
+    expect(smsMock.sendSms).toHaveBeenCalledTimes(1); // still exactly one send
+    expect(inserted).toHaveLength(1); // no second row written
   });
 
-  it("the explicit resend path (POST /orders/:orderId/resend-email) is intentional and does send again", async () => {
-    // This is the SAME sendOrderSms() call as the status-update path - there
-    // is no separate "resend" flag or bypass, because there is no dedupe to
-    // bypass in the first place. Documenting current behaviour: an explicit
-    // resend does successfully send a fresh SMS, which is the desired part
-    // of Step 4's scope, but it works only because nothing was blocking a
-    // resend to begin with.
+  it("sends again after the dedupe window passes (a genuinely new status update)", async () => {
+    smsMock.isSmsConfigured.mockReturnValue(true);
+    usageMock.getMonthlySmsUsage.mockResolvedValue(0);
+    smsMock.sendSms.mockResolvedValue({ success: true, providerMessageId: "msg-2" });
+
+    // Window has elapsed: no recent duplicate, so the new status sends.
+    dbState.recentDuplicates = [];
+    const result = await sendOrderSms({ ...BASE_PARAMS, businessPlan: "beta" });
+
+    expect(result.smsStatus).toBe("sent");
+    expect(smsMock.sendSms).toHaveBeenCalledTimes(1);
+  });
+
+  it("the explicit resend path bypasses dedupe and sends again", async () => {
+    // The /orders/:orderId/resend-email route passes skipDuplicateCheck: true
+    // (orders.ts:1230) because an explicit user-triggered resend should always
+    // go out, even if an identical message was sent moments ago.
     smsMock.isSmsConfigured.mockReturnValue(true);
     usageMock.getMonthlySmsUsage.mockResolvedValue(0);
     smsMock.sendSms.mockResolvedValue({ success: true, providerMessageId: "msg-resend" });
+    dbState.recentDuplicates = [{ id: "sms-notif-1" }]; // would block a normal send
 
-    const result = await sendOrderSms({ ...BASE_PARAMS, businessPlan: "beta" });
+    const result = await sendOrderSms({
+      ...BASE_PARAMS,
+      businessPlan: "beta",
+      skipDuplicateCheck: true,
+    });
 
     expect(result.smsStatus).toBe("sent");
     expect(smsMock.sendSms).toHaveBeenCalledTimes(1);
@@ -228,7 +266,7 @@ describe("sendOrderSms — edge cases", () => {
 
   it("passes an unvalidated/garbage phone number straight through to the provider layer", async () => {
     // order-notifications.ts does no phone-format validation itself; it
-    // relies entirely on sms.ts's normaliseNumber(). Confirms the two layers
+    // relies entirely on sms.ts's normalisePhoneNumber(). Confirms the two layers
     // are wired together as expected rather than each silently assuming the
     // other validates.
     smsMock.sendSms.mockResolvedValue({ success: false, error: "Invalid destination number" });
@@ -241,8 +279,18 @@ describe("sendOrderSms — edge cases", () => {
     expect(result.smsStatus).toBe("failed");
   });
 
-  it("two concurrent triggers for the same order both go through independently (no lock/dedupe)", async () => {
+  it("two CONCURRENT triggers for the same order can still double-send (no lock)", async () => {
+    // Honest gap: dedupe is a read-then-write, not a transactional lock. When
+    // two requests both query before either inserts, both see "no recent
+    // duplicate" and both send. A unique constraint on sms_notifications
+    // would not help either - the two rows differ in id and body is identical.
+    // Mitigation is the route-level forward-progression guard plus the 5-minute
+    // window, which catches the far more common single-retry case; true
+    // concurrent double-sends need a lock or idempotency key at the route.
+    smsMock.isSmsConfigured.mockReturnValue(true);
+    usageMock.getMonthlySmsUsage.mockResolvedValue(0);
     smsMock.sendSms.mockResolvedValue({ success: true, providerMessageId: "msg-concurrent" });
+    dbState.recentDuplicates = []; // both queries run before either insert
 
     const [a, b] = await Promise.all([
       sendOrderSms({ ...BASE_PARAMS, businessPlan: "beta" }),
