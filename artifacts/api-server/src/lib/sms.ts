@@ -35,21 +35,48 @@ export interface SmsProvider {
 }
 
 // ─── Phone number validation ─────────────────────────────────────────────────
-// Deliberately lightweight (no phone-number library): reject anything that
-// obviously isn't a phone number (empty, letters, way too short/long) while
-// still accepting both E.164 ("+27821234567") and plain local-format numbers
-// ("0821234567") that real customer records contain. A "+" is only valid as
-// the very first character.
-export function normalisePhoneNumber(raw: string): string {
-  return raw.replace(/[^\d+]/g, "");
+// SMSPortal requires international numbers in E.164 format. Customer records
+// may still contain common South African local or formatted values, so those
+// are converted here at the provider boundary rather than changing the
+// customer schema or the admin form.
+export function normalisePhoneNumber(raw: string): string | null {
+  const value = raw.trim();
+  if (!value) return null;
+
+  // Keep a leading plus only; any other plus or non-phone characters makes the
+  // value invalid instead of silently turning it into a different number.
+  if (value.includes("+") && !value.startsWith("+")) return null;
+  const digits = value.replace(/[\s().-]/g, "");
+  if (!/^\+?\d+$/.test(digits)) return null;
+
+  if (digits.startsWith("+")) {
+    return `+${digits.slice(1)}`;
+  }
+  if (digits.startsWith("00")) {
+    return `+${digits.slice(2)}`;
+  }
+  if (digits.startsWith("0")) {
+    // South African local numbers are ten digits, including the trunk prefix.
+    if (digits.length !== 10) return null;
+    return `+27${digits.slice(1)}`;
+  }
+
+  // An international number without the plus sign, such as 27821234567.
+  return `+${digits}`;
 }
 
 export function isValidPhoneNumber(raw: string | null | undefined): boolean {
   if (!raw) return false;
   const normalised = normalisePhoneNumber(raw);
-  if (normalised.includes("+") && !normalised.startsWith("+")) return false;
-  const digitCount = normalised.replace(/\+/g, "").length;
-  return digitCount >= 9 && digitCount <= 15;
+  if (!normalised) return false;
+  const digits = normalised.slice(1);
+  return /^\d{9,15}$/.test(digits);
+}
+
+function maskedPhoneNumber(raw: string | null | undefined): string {
+  const normalised = raw ? normalisePhoneNumber(raw) : null;
+  if (!normalised) return raw?.trim() ? "[invalid]" : "[missing]";
+  return `${normalised.slice(0, 3)}***${normalised.slice(-2)}`;
 }
 
 // ─── SMSPortal provider ──────────────────────────────────────────────────────
@@ -226,11 +253,15 @@ export async function sendSms(params: SendSmsParams): Promise<SmsResult> {
     // Hard gate: the channel is off for this release.
     return { success: false, error: "SMS channel disabled", skipped: true };
   }
-  if (!isValidPhoneNumber(params.to)) {
+  const to = normalisePhoneNumber(params.to);
+  if (!to || !isValidPhoneNumber(to)) {
+    logger.warn(
+      { destination: maskedPhoneNumber(params.to) },
+      "SMS send rejected because the destination phone number is invalid",
+    );
     return { success: false, error: "Invalid destination phone number" };
   }
 
   const provider = getSmsProvider();
-  const to = normalisePhoneNumber(params.to);
   return provider.send({ to, body: params.body });
 }

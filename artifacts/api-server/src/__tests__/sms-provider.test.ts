@@ -44,6 +44,8 @@ beforeEach(async () => {
   vi.resetModules();
   flagState.smsNotifications = true;
   process.env = { ...ORIGINAL_ENV };
+  // These tests exercise the real SMSPortal provider, not the test-mode noop.
+  delete process.env.NODE_ENV;
   delete process.env.SMSPORTAL_CLIENT_ID;
   delete process.env.SMSPORTAL_API_SECRET;
   delete process.env.SMS_SENDER_ID;
@@ -125,6 +127,26 @@ describe("sendSms — successful send", () => {
       content: "Your order has shipped",
       destination: "+27712345678", // normalised: spaces stripped
     });
+  });
+
+  it.each([
+    ["local South African", "0821234567", "+27821234567"],
+    ["international with plus", "+27821234567", "+27821234567"],
+    ["international without plus", "27821234567", "+27821234567"],
+    ["formatted local", "082 123 4567", "+27821234567"],
+  ])("normalises a %s number to E.164", async (_label, input, expectedDestination) => {
+    mockAuthOk();
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ messages: [{ messageId: "msg-normalised" }] }),
+    } as Response);
+
+    const result = await sendSms({ to: input, body: "Test" });
+
+    expect(result).toEqual({ success: true, providerMessageId: "msg-normalised" });
+    const body = JSON.parse(fetchMock.mock.calls[1][1].body);
+    expect(body.messages[0].destination).toBe(expectedDestination);
   });
 
   it("includes the configured sender ID when SMS_SENDER_ID is set", async () => {
@@ -283,32 +305,24 @@ describe("sendSms — invalid destination number", () => {
 
   it("rejects an empty/whitespace-only number before calling the provider", async () => {
     const result = await sendSms({ to: "   ", body: "Hi" });
-    expect(result).toEqual({ success: false, error: "Invalid destination number" });
+    expect(result).toEqual({ success: false, error: "Invalid destination phone number" });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("rejects a number with no digits at all", async () => {
     const result = await sendSms({ to: "not-a-number", body: "Hi" });
-    expect(result).toEqual({ success: false, error: "Invalid destination number" });
+    expect(result).toEqual({ success: false, error: "Invalid destination phone number" });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("BUG: does not reject a digit string that is not a plausible phone number", async () => {
-    // normaliseNumber() only strips non-digit/non-plus characters; it never
-    // checks length or a country-code prefix. "123" survives normalisation
-    // and is sent to the provider as-is. This is a real gap — flagged in the
-    // test report as a recommended fix (add a minimum-length / E.164 check).
-    mockAuthOk();
-    fetchMock.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ messages: [{ messageId: "msg-1" }] }),
-    } as Response);
+  it.each(["123", "082123", "not-a-number", "+27 82 123 4567 ext 1"])(
+    "rejects an invalid destination %s before calling the provider",
+    async (input) => {
+      const result = await sendSms({ to: input, body: "Hi" });
 
-    const result = await sendSms({ to: "123", body: "Hi" });
+      expect(result).toEqual({ success: false, error: "Invalid destination phone number" });
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
 
-    expect(result.success).toBe(true);
-    const body = JSON.parse(fetchMock.mock.calls[1][1].body);
-    expect(body.messages[0].destination).toBe("123");
-  });
 });
